@@ -1,0 +1,6 @@
+*.o
+graph_coloring_test
+results/
+*.csv
+.DS_Store
+.vscode/
