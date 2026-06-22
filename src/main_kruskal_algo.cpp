@@ -1,86 +1,103 @@
 #include "graph.hpp"
 #include "kruskal.hpp"
+#include "correctness.hpp"
 
 #include <iostream>
 #include <mpi.h>
+#include <cstdlib>
+#include <string>
 
 using namespace std;
 
-// Ham nay duoc goi tu dispatcher chinh (file main_), KHONG tu goi MPI_Init/
-// MPI_Finalize ben trong - viec do thuoc trach nhiem cua dispatcher, giong
-// nhu main_bellman_ford / main_coloring.
-int main_kruskal(int argc, char** argv) {
-    int rank, worldSize;
+namespace {
+    // Hàm hỗ trợ đọc tham số cấu hình từ Terminal
+    int getIntArg(int argc, char** argv, const std::string& key, int defaultValue) {
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (argv[i] == key) {
+                return std::atoi(argv[i + 1]);
+            }
+        }
+        return defaultValue;
+    }
+
+    double getDoubleArg(int argc, char** argv, const std::string& key, double defaultValue) {
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (argv[i] == key) {
+                return std::atof(argv[i + 1]);
+            }
+        }
+        return defaultValue;
+    }
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int rank = 0;
+    int worldSize = 1;
+
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
 
-    if (rank == 0) {
-        cout << "=== DEMO THUAT TOAN KRUSKAL ===" << endl;
-        cout << "So tien trinh MPI: " << worldSize << endl;
-    }
+    // Lấy thông số từ lệnh mpirun (giống hệt thuật toán Tô màu đồ thị)
+    int vertices = getIntArg(argc, argv, "--vertices", 1000);
+    double density = getDoubleArg(argc, argv, "--density", 0.1);
+    int seed = getIntArg(argc, argv, "--seed", 42);
 
-    int graphSize = 6;
-    if (argc > 1) {
-        graphSize = std::atoi(argv[1]);
-    }
+    Graph graph(vertices, false);
 
-    Graph graph(graphSize, false);
-
-    // Sinh do thi ngau nhien tren rank 0 roi Bcast cho cac rank con lai,
-    // dam bao moi rank co cung mot do thi.
-    graph.generateRandomMPI(0.5, 1, 10, false, 42, rank, worldSize);
+    // Sinh đồ thị trên rank 0 và Broadcast đi toàn mạng
+    graph.generateRandomMPI(density, 1, 10, false, seed, rank, worldSize);
 
     if (rank == 0) {
-        graph.printSmallGraph();
+        cout << "Kruskal MST test\n";
+        cout << "Vertices: " << vertices << "\n";
+        cout << "Edges: " << graph.edgeCount() << "\n";
+        cout << "Density: " << density << "\n";
+        cout << "MPI processes: " << worldSize << "\n\n";
+    }
+
+    KruskalResult seqResult;
+
+    // ----- CHẠY TUẦN TỰ -----
+    if (rank == 0) {
+        seqResult = kruskalSequential(graph);
+
+        cout << "[Sequential]\n";
+        cout << "Correct: " << (seqResult.success ? "YES" : "NO") << "\n";
+        cout << "Total weight: " << seqResult.totalWeight << "\n";
+        // Bỏ nhân 1000 để hiển thị đơn vị giây (seconds) thay vì mili-giây
+        cout << "Total time: " << seqResult.totalTime << " seconds\n\n"; 
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // ---------- Chay ban tuan tu (chi tren rank 0) ----------
+    // ----- CHẠY SONG SONG MPI -----
+    KruskalResult mpiResult = kruskalMPI(graph, rank, worldSize);
+
+    double maxTotalTime = 0.0;
+    double maxComputeTime = 0.0;
+    double maxCommunicationTime = 0.0;
+
+    // Gom thời gian chạy lớn nhất từ các máy ảo về Master
+    MPI_Reduce(&mpiResult.totalTime, &maxTotalTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&mpiResult.computeTime, &maxComputeTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&mpiResult.communicationTime, &maxCommunicationTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        cout << "\n=== KRUSKAL - BAN TUAN TU ===" << endl;
-
-        KruskalResult result = kruskalSequential(graph);
-
-        if (result.success) {
-            cout << result.message << endl;
-            cout << "Tong trong so: " << result.totalWeight << endl;
-            cout << "Cac canh trong MST (" << result.mstEdges.size() << " canh):\n";
-            for (const auto& edge : result.mstEdges) {
-                cout << edge.u << " - " << edge.v << " (trong so: " << edge.weight << ")\n";
-            }
-        } else {
-            cout << "Loi: " << result.message << endl;
+        cout << "[MPI]\n";
+        cout << "Correct: " << (mpiResult.success ? "YES" : "NO") << "\n";
+        cout << "Total weight: " << mpiResult.totalWeight << "\n";
+        cout << "Max total time: " << maxTotalTime << " seconds\n";
+        cout << "Max compute time: " << maxComputeTime << " seconds\n";
+        cout << "Max communication time: " << maxCommunicationTime << " seconds\n";
+        
+        if (seqResult.totalWeight != mpiResult.totalWeight) {
+            cout << "\nWARNING: MPI weight (" << mpiResult.totalWeight 
+                 << ") does not match Sequential weight (" << seqResult.totalWeight << ")!\n";
         }
-        cout << "Thoi gian thuc hien: " << result.totalTime * 1000 << " ms" << endl;
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // ---------- Chay ban phan tan MPI (tren tat ca cac rank) ----------
-    if (rank == 0) {
-        cout << "\n=== KRUSKAL - BAN PHAN TAN (MPI) ===" << endl;
-    }
-
-    KruskalResult distResult = kruskalMPI(graph, rank, worldSize);
-
-    if (rank == 0) {
-        if (distResult.success) {
-            cout << distResult.message << endl;
-            cout << "Tong trong so: " << distResult.totalWeight << endl;
-            cout << "Cac canh trong MST (" << distResult.mstEdges.size() << " canh):\n";
-            for (const auto& edge : distResult.mstEdges) {
-                cout << edge.u << " - " << edge.v << " (trong so: " << edge.weight << ")\n";
-            }
-        } else {
-            cout << "Loi: " << distResult.message << endl;
-        }
-        cout << "Thoi gian thuc hien: " << distResult.totalTime * 1000 << " ms" << endl;
-        cout << "  - Compute: " << distResult.computeTime * 1000 << " ms" << endl;
-        cout << "  - Communication: " << distResult.communicationTime * 1000 << " ms" << endl;
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
+    MPI_Finalize();
     return 0;
 }
